@@ -5,7 +5,8 @@ The zoom runs at a steady pace. Bass hits pull the pace down, highs push it up,
 and it always eases back to steady when the music calms down.
 
 Keys (while running):
-  1-9 / Tab / arrows  switch fractal   p     next color palette
+  1-9 / Tab / arrows  switch fractal   p / P next / previous color palette
+  a           auto DJ (drops switch fractal)  s  save a screenshot
   + / -       base zoom speed          [ ]   audio sensitivity
   d           detail (1x/2x/3x)        r     restart the zoom
   h           pin the info bar (it hides itself after 5s without a keypress)
@@ -16,6 +17,7 @@ import argparse
 import colorsys
 import math
 import os
+import random
 import select
 import shutil
 import signal
@@ -155,9 +157,12 @@ def mandelbrot(px, maxit, _t):
     return _escape(np.zeros_like(px), px, lambda z, c: z * z + c, maxit, skip=known)
 
 
-def julia(px, maxit, t):
-    # c drifts very slowly around a lovely spot so the shape breathes
-    c = complex(-0.7269 + 0.012 * math.cos(t * 0.05), 0.1889 + 0.012 * math.sin(t * 0.05))
+# Shape settings the music bends live (Show.update sets these every frame).
+LIVE = {"julia_c": complex(-0.7269, 0.1889), "phoenix": (0.5667, -0.5)}
+
+
+def julia(px, maxit, _t):
+    c = LIVE["julia_c"]
     return _escape(px, np.full(px.shape, c), lambda z, c: z * z + c, maxit)
 
 
@@ -206,14 +211,15 @@ def newton(px, maxit, _t):
 
 def phoenix(px, maxit, _t):
     """Like Julia, but each step also remembers the step before it:
-    z = z² + 0.5667 - 0.5·(previous z). Drawn on its side so it stands up."""
+    z = z² + p + q·(previous z), p≈0.5667, q≈-0.5. Drawn on its side so it stands up."""
     out = np.full(px.shape, float(maxit))
     flat = out.ravel()
     z = (px.imag - 1j * px.real).ravel().copy()
     prev = np.zeros_like(z)
     idx = np.arange(z.size)
+    p, q = LIVE["phoenix"]
     for i in range(maxit):
-        z, prev = z * z + 0.5667 - 0.5 * prev, z
+        z, prev = z * z + p + q * prev, z
         mag = z.real * z.real + z.imag * z.imag
         esc = mag > 256.0
         if esc.any():
@@ -453,7 +459,7 @@ def _grad(stops, n=256):
 
 
 PALETTES = [
-    ("Glow", None),  # black -> audio color, built on the fly by glow_cells()
+    ("Glow", None),  # black -> audio color, built on the fly by glow_palette()
     ("Electric", _grad([(0, 7, 100), (32, 107, 203), (237, 255, 255), (255, 170, 0), (60, 2, 60)])),
     ("Fire", _grad([(10, 0, 0), (180, 20, 0), (255, 140, 0), (255, 240, 120), (90, 0, 40)])),
     ("Neon", _grad([(10, 0, 30), (255, 0, 160), (0, 255, 220), (120, 0, 255), (255, 255, 80)])),
@@ -476,20 +482,28 @@ def build_cells(pal):
 GLOW_LEVELS = 64
 PURPLE_HUE, ORANGE_HUE = 275, 390  # 390 = 30 (orange), going the long way through pink/red
 _glow_cache = {}
+_cells_cache = {}
 
 
-def glow_cells(tint):
-    """Cells for the Glow look: black fading up to the audio color, with a
+def glow_palette(tint):
+    """Colors for the Glow look: black fading up to the audio color, with a
     white-hot core at the very brightest. tint 0 = purple (bass), 1 = orange (highs).
-    Cached in 32 steps so we're not rebuilding thousands of strings every frame."""
+    Snapped to 32 steps so the terminal can cache the cells for each one."""
     q = int(round(tint * 31))
     if q not in _glow_cache:
         hue = (PURPLE_HUE + (ORANGE_HUE - PURPLE_HUE) * q / 31) % 360 / 360
         color = np.array(colorsys.hsv_to_rgb(hue, 1.0, 1.0))
         b = np.linspace(0, 1, GLOW_LEVELS)[:, None]
         rgb = color * b ** 1.4 + 0.75 * b ** 8  # color rises, then burns toward white
-        _glow_cache[q] = build_cells((np.clip(rgb, 0, 1) * 255).astype(int))
-    return _glow_cache[q]
+        _glow_cache[q] = (np.clip(rgb, 0, 1) * 255).astype(int)
+    return ("glow", q), _glow_cache[q]
+
+
+def cells_for(key, pal):
+    """Terminal cells for a palette, built once and then reused."""
+    if key not in _cells_cache:
+        _cells_cache[key] = build_cells(pal)
+    return _cells_cache[key]
 
 
 def shrink(a, ss):
@@ -631,6 +645,159 @@ class Zoom:
         self.targets[self.ti % len(self.targets)] = (nx, ny)
 
 
+class Show:
+    """Everything that changes over time: the camera, how the music pushes it,
+    the colors, and auto DJ mode."""
+
+    def __init__(self, fractal_index, audio):
+        self.audio = audio
+        self.pace = Pace()
+        self.zoom = Zoom(fractal_index)
+        self.pal_i = 0
+        self.base_speed = 0.35        # how fast "steady" is (zoom rate per second)
+        self.mult = 1.0               # current speed multiplier from the music
+        self.color_shift = 0.0
+        self.glow_range = None        # smoothed brightness range so the glow doesn't flicker
+        self.t = 0.0
+        self.shape_bass = self.shape_treble = 0.0  # smoothed 0..1 pushes on the shape
+        self.dj = False
+        self.dj_timer = 0.0
+        self.flash = 0.0              # brief burst of light when DJ mode switches
+
+    def set_fractal(self, i):
+        self.zoom.set_fractal(i % len(FRACTALS))
+        self.glow_range = None
+
+    def update(self, dt):
+        self.t += dt
+        bands = self.audio.bands() if self.audio and self.audio.ok else (0, 0, 0)
+        self.mult, mid = self.pace.update(bands, dt)
+        self.zoom.step(dt, self.base_speed * self.mult)
+        self.color_shift += dt * (6 + 30 * max(mid, 0))  # mids nudge the colors
+        self.flash *= math.exp(-3 * dt)
+
+        # ---- music bends the shape (Julia and Phoenix). Quick to push, slow to
+        # relax, like the speed. The push shrinks as we zoom in: deep down a tiny
+        # nudge already rearranges everything, and a big one would just be static.
+        for name, dev in (("shape_bass", self.pace.bass), ("shape_treble", self.pace.treble)):
+            want = min(max(dev, 0.0), 2.0) / 2
+            cur = getattr(self, name)
+            setattr(self, name, cur + (want - cur) * min(1.0, dt * (10 if want > cur else 2.5)))
+        z = self.zoom
+        amp = 0.045 * (z.scale / z.start_scale) ** 1.2 * min(self.pace.sensitivity, 2.0)
+        drift = 0.012 * complex(math.cos(self.t * 0.05), math.sin(self.t * 0.05))  # slow breathing
+        LIVE["julia_c"] = (complex(-0.7269, 0.1889) + drift
+                           + amp * (self.shape_bass * complex(-0.6, -0.8) + self.shape_treble * complex(0.8, -0.6)))
+        LIVE["phoenix"] = (0.5667 + 0.6 * amp * self.shape_treble, -0.5 + 0.6 * amp * self.shape_bass)
+
+        # ---- auto DJ: a big bass drop (or 40s of nothing) switches things up
+        if self.dj and not z.rewinding:
+            self.dj_timer += dt
+            if (self.pace.bass > 1.2 and self.dj_timer > 12) or self.dj_timer > 40:
+                self.dj_next()
+
+    def dj_next(self):
+        self.dj_timer = 0.0
+        self.set_fractal(random.choice([i for i in range(len(FRACTALS)) if i != self.zoom.fi]))
+        if random.random() < 0.4:
+            self.pal_i = random.randrange(len(PALETTES))
+        self.flash = 1.0
+
+    @property
+    def depth(self):
+        return max(0.0, math.log10(self.zoom.start_scale / self.zoom.scale))
+
+    @property
+    def maxit(self):
+        return int(min(1500, 150 + 75 * self.depth))  # deeper = more steps = finer detail
+
+
+def render(show, W, H, ss, dt=0.0, live=True):
+    """Compute one W x H frame. Returns (idx, n, key, palette): each pixel's palette
+    index (index n = pure black), a cache key for the palette, and its RGB colors.
+    live=False (screenshots) leaves the camera and smoothing untouched."""
+    zoom = show.zoom
+    # detail: compute ss x ss sample points per screen pixel, then average
+    # them, which smooths jagged edges and shows finer filaments
+    aspect = W / H
+    xs = np.linspace(zoom.cx - zoom.scale * aspect, zoom.cx + zoom.scale * aspect, W * ss)
+    ys = np.linspace(zoom.cy + zoom.scale, zoom.cy - zoom.scale, H * ss)
+    maxit = show.maxit
+    img_hi = zoom.fn(xs[None, :] + 1j * ys[:, None], maxit, show.t)
+    inside_hi = img_hi >= maxit
+    inside_frac = shrink(inside_hi.astype(float), ss)
+    inside = inside_frac > 0.5
+    if live:
+        zoom.steer(shrink(np.where(inside_hi, 0.0, img_hi), ss), inside)
+
+    if PALETTES[show.pal_i][1] is None:
+        # ---- Glow: the slower a point escapes, the closer it is to the
+        # fractal's edge, so it gets brighter. Everything else sinks to black.
+        esc = img_hi[~inside_hi]
+        rng = show.glow_range
+        if esc.size:
+            lo, hi = np.percentile(esc, 2), np.percentile(esc, 99.7)
+            if not live:
+                rng = rng or [lo, hi]
+            elif rng is None:
+                rng = show.glow_range = [lo, hi]
+            else:
+                rng[0] += (lo - rng[0]) * min(1.0, dt * 3)
+                rng[1] += (hi - rng[1]) * min(1.0, dt * 3)
+        lo, hi = rng or (0, 1)
+        # log curve: escape counts bunch up at the low end, this spreads them out
+        v = np.log1p(np.clip(img_hi - lo, 0, None)) / np.log1p(max(hi - lo, 1e-9))
+        v = np.clip(v, 0, 1) ** 2.2     # push the background down to black
+        v[inside_hi] = 0
+        v = shrink(v, ss)
+        halo = v
+        for _ in range(max(1, round(W / 220))):  # bloom size grows with the picture
+            halo = blur(blur(halo))
+        v = v + 0.9 * halo              # bloom: light spills onto neighbours
+        v *= 1 + 0.35 * max(show.pace.bass, 0) + 0.8 * show.flash  # bass hits pulse the brightness
+        n = GLOW_LEVELS
+        idx = (np.clip(v, 0, 1) * (n - 1)).astype(int)
+        idx[inside & (v < 0.02)] = n  # deep inside the set = pure black
+        key, pal = glow_palette(show.pace.tint)
+    else:
+        # ---- classic palettes: log-ish stretch keeps bands nice at any depth
+        n = 256
+        s = shrink(np.where(inside_hi, 0.0, np.sqrt(np.maximum(img_hi, 0))), ss)
+        s /= np.maximum(1 - inside_frac, 1e-9)  # average of the escaping samples only
+        idx = (s * 24 + show.color_shift).astype(int) % n
+        idx[inside] = n
+        key, pal = ("pal", show.pal_i), PALETTES[show.pal_i][1]
+    return idx, n, key, pal
+
+
+SHOT_DIR = os.path.expanduser("~/Pictures/fractalviz")
+
+
+def save_image(rgb, name):
+    """Save an H x W x 3 uint8 array as a PNG in ~/Pictures/fractalviz."""
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    slug = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")
+    base = os.path.join(SHOT_DIR, f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}")
+    path, n = base + ".png", 2
+    while os.path.exists(path):  # two shots in the same second: don't overwrite
+        path, n = f"{base}-{n}.png", n + 1
+    try:
+        from PIL import Image
+        Image.fromarray(rgb).save(path)
+    except ImportError:  # no Pillow: plain PPM, which most image viewers still open
+        path = path[:-4] + ".ppm"
+        with open(path, "wb") as f:
+            f.write(b"P6 %d %d 255\n" % (rgb.shape[1], rgb.shape[0]) + rgb.tobytes())
+    return path
+
+
+def screenshot(show, W=1280, H=720):
+    """A sharp still of the current view (rendered fresh, not the blocky terminal one)."""
+    idx, n, _key, pal = render(show, W, H, 1, live=False)
+    colors = np.vstack([pal, [[0, 0, 0]]]).astype(np.uint8)
+    return save_image(colors[idx], FRACTALS[show.zoom.fi][0])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-f", "--fractal", type=int, choices=range(1, len(FRACTALS) + 1),
@@ -639,13 +806,13 @@ def main():
     ap.add_argument("--fps", type=int, default=144, help="frame rate cap (default 144)")
     ap.add_argument("--detail", type=int, choices=(1, 2, 3), default=2,
                     help="pixels computed per screen pixel, per side (default 2 = 4x smoother)")
+    ap.add_argument("--dj", action="store_true", help="start in auto DJ mode")
     args = ap.parse_args()
 
     if not sys.stdout.isatty():
         sys.exit("fractalviz needs to run in a terminal")
 
     audio = Audio(args.mic)
-    pace = Pace()
     resized = [True]
     signal.signal(signal.SIGWINCH, lambda *a: resized.__setitem__(0, True))
 
@@ -654,18 +821,16 @@ def main():
             fi = args.fractal - 1 if args.fractal else menu(term)
             if fi is None:
                 return
-            zoom = Zoom(fi)
-            pal_i = 0
-            cells = None
-            glow_range = None  # smoothed brightness range so the glow doesn't flicker
-            base_speed = 0.35  # how fast "steady" is (zoom rate per second)
+            show = Show(fi, audio)
+            show.dj = args.dj
+            pace = show.pace
             hud_pinned = False
             hud_until = time.time() + 5  # bar hides itself 5s after the last keypress
             show_hud = True
             ss = args.detail
-            color_shift = 0.0
+            note = ""                    # short message shown in the bar, e.g. "saved ..."
+            shots = []                   # screenshots being saved in the background
             last = time.time()
-            t0 = last
             fps_avg = args.fps
 
             while True:
@@ -677,18 +842,19 @@ def main():
                     if k in ("q", "\x1b"):
                         return
                     if k.isdigit() and 1 <= int(k) <= min(9, len(FRACTALS)):
-                        zoom.set_fractal(int(k) - 1)
+                        show.set_fractal(int(k) - 1)
                     elif k in ("\t", "right"):
-                        zoom.set_fractal((zoom.fi + 1) % len(FRACTALS))
+                        show.set_fractal(show.zoom.fi + 1)
                     elif k == "left":
-                        zoom.set_fractal((zoom.fi - 1) % len(FRACTALS))
+                        show.set_fractal(show.zoom.fi - 1)
                     elif k == "p":
-                        pal_i = (pal_i + 1) % len(PALETTES)
-                        cells = build_cells(PALETTES[pal_i][1]) if PALETTES[pal_i][1] is not None else None
+                        show.pal_i = (show.pal_i + 1) % len(PALETTES)
+                    elif k == "P":  # shift+p goes back
+                        show.pal_i = (show.pal_i - 1) % len(PALETTES)
                     elif k in ("+", "="):
-                        base_speed = min(2.0, base_speed * 1.2)
+                        show.base_speed = min(2.0, show.base_speed * 1.2)
                     elif k in ("-", "_"):
-                        base_speed = max(0.05, base_speed / 1.2)
+                        show.base_speed = max(0.05, show.base_speed / 1.2)
                     elif k == "]":
                         pace.sensitivity = min(4.0, pace.sensitivity * 1.25)
                     elif k == "[":
@@ -699,14 +865,40 @@ def main():
                             hud_until = 0  # unpinning hides it right away
                     elif k == "d":
                         ss = ss % 3 + 1
+                    elif k == "a":
+                        show.dj = not show.dj
+                        show.dj_timer = 0.0
+                        note = "auto DJ on" if show.dj else "auto DJ off"
+                    elif k == "s":
+                        # render the still in the background so the zoom keeps going
+                        snap = Show.__new__(Show)
+                        snap.__dict__.update(show.__dict__)
+                        snap.zoom = Zoom.__new__(Zoom)
+                        snap.zoom.__dict__.update(show.zoom.__dict__)
+                        shot = [None]
+                        shots.append(shot)
+
+                        def save(s=snap, r=shot):
+                            try:
+                                r[0] = "saved " + screenshot(s).replace(os.path.expanduser("~"), "~")
+                            except Exception as e:  # never leave it stuck on "saving"
+                                r[0] = f"screenshot failed: {e}"
+                        threading.Thread(target=save, daemon=True).start()
+                        note = "📸 saving…" if len(shots) == 1 else f"📸 saving {len(shots)}…"
                     elif k == "r":
-                        zoom.set_fractal(zoom.fi)
+                        show.set_fractal(show.zoom.fi)
                     k = term.key(0)
+                for shot in [s for s in shots if s[0] is not None]:
+                    shots.remove(shot)
+                    note = shot[0]
+                    hud_until = time.time() + 5
 
                 want_hud = hud_pinned or time.time() < hud_until
                 if want_hud != show_hud:
                     show_hud = want_hud
                     resized[0] = True
+                    if not show_hud:
+                        note = ""
                 if resized[0]:
                     cols, rows = shutil.get_terminal_size()
                     resized[0] = False
@@ -714,59 +906,16 @@ def main():
                 img_rows = rows - (1 if show_hud else 0)
                 W, H = cols, img_rows * 2  # two pixels per character row
 
-                # ---- timing + audio
+                # ---- timing, music, camera
                 now = time.time()
                 dt = min(0.1, now - last)
                 last = now
                 fps_avg += (1 / max(dt, 1e-3) - fps_avg) * 0.05
-                mult, mid = pace.update(audio.bands() if audio.ok else (0, 0, 0), dt)
-                zoom.step(dt, base_speed * mult)
-                color_shift += dt * (6 + 30 * max(mid, 0))  # mids nudge the colors
+                show.update(dt)
 
-                # ---- compute the fractal
-                # detail: compute ss x ss sample points per screen pixel, then
-                # average them, which smooths jagged edges and shows finer filaments
-                aspect = W / H
-                xs = np.linspace(zoom.cx - zoom.scale * aspect, zoom.cx + zoom.scale * aspect, W * ss)
-                ys = np.linspace(zoom.cy + zoom.scale, zoom.cy - zoom.scale, H * ss)
-                px = xs[None, :] + 1j * ys[:, None]
-                depth = max(0.0, math.log10(zoom.start_scale / zoom.scale))
-                maxit = int(min(1500, 150 + 75 * depth))  # deeper = more steps = finer detail
-                img_hi = zoom.fn(px, maxit, now - t0)
-                inside_hi = img_hi >= maxit
-                inside_frac = shrink(inside_hi.astype(float), ss)
-                inside = inside_frac > 0.5
-                zoom.steer(shrink(np.where(inside_hi, 0.0, img_hi), ss), inside)
-
-                if PALETTES[pal_i][1] is None:
-                    # ---- Glow: the slower a point escapes, the closer it is to the
-                    # fractal's edge, so it gets brighter. Everything else sinks to black.
-                    esc = img_hi[~inside_hi]
-                    if esc.size:
-                        lo, hi = np.percentile(esc, 2), np.percentile(esc, 99.7)
-                        if glow_range is None:
-                            glow_range = [lo, hi]
-                        glow_range[0] += (lo - glow_range[0]) * min(1.0, dt * 3)
-                        glow_range[1] += (hi - glow_range[1]) * min(1.0, dt * 3)
-                    lo, hi = glow_range or (0, 1)
-                    # log curve: escape counts bunch up at the low end, this spreads them out
-                    v = np.log1p(np.clip(img_hi - lo, 0, None)) / np.log1p(max(hi - lo, 1e-9))
-                    v = np.clip(v, 0, 1) ** 2.2     # push the background down to black
-                    v[inside_hi] = 0
-                    v = shrink(v, ss)
-                    v = v + 0.9 * blur(blur(v))     # bloom: light spills onto neighbours
-                    v *= 1 + 0.35 * max(pace.bass, 0)  # bass hits pulse the brightness
-                    n = GLOW_LEVELS
-                    idx = (np.clip(v, 0, 1) * (n - 1)).astype(int)
-                    idx[inside & (v < 0.02)] = n  # deep inside the set = pure black
-                    cells = glow_cells(pace.tint)
-                else:
-                    # ---- classic palettes: log-ish stretch keeps bands nice at any depth
-                    n = 256
-                    s = shrink(np.where(inside_hi, 0.0, np.sqrt(np.maximum(img_hi, 0))), ss)
-                    s /= np.maximum(1 - inside_frac, 1e-9)  # average of the escaping samples only
-                    idx = (s * 24 + color_shift).astype(int) % n
-                    idx[inside] = n
+                # ---- draw
+                idx, n, key, pal = render(show, W, H, ss, dt)
+                cells = cells_for(key, pal)
                 pair = idx[0::2] * (n + 1) + idx[1::2]
                 # a cell the same colors as the one before it only needs the bare "▀",
                 # not the color codes again: much less for the terminal to chew on
@@ -783,9 +932,13 @@ def main():
                     def tint_bar(t):
                         return "purple " + "─" * int(t * 6) + "●" + "─" * (6 - int(t * 6)) + " orange"
                     status = "" if audio.ok else "  [no audio: steady pace]"
-                    hud = (f" {FRACTALS[zoom.fi][0]} │ {fps_avg:3.0f}/{args.fps}fps │ detail {ss}x │ speed {mult:4.2f}x │ bass {bar(pace.bass / 2)}"
-                           f" treble {bar(pace.treble / 2)} │ zoom 1e{depth:4.1f} │ {PALETTES[pal_i][0]}{' ' + tint_bar(pace.tint) if PALETTES[pal_i][1] is None else ''}"
-                           f" │ 1-9 Tab p d +- [] h{'(pinned)' if hud_pinned else ''} q{status}")
+                    glow = PALETTES[show.pal_i][1] is None
+                    hud = (f" {FRACTALS[show.zoom.fi][0]}{' │ DJ' if show.dj else ''} │ {fps_avg:3.0f}/{args.fps}fps"
+                           f" │ detail {ss}x │ speed {show.mult:4.2f}x │ bass {bar(pace.bass / 2)}"
+                           f" treble {bar(pace.treble / 2)} │ zoom 1e{show.depth:4.1f} │ {PALETTES[show.pal_i][0]}"
+                           f"{' ' + tint_bar(pace.tint) if glow else ''}"
+                           f"{' │ ' + note if note else ''}"
+                           f" │ 1-9 Tab p/P d a s +- [] h{'(pinned)' if hud_pinned else ''} q{status}")
                     out.append(f"\n\x1b[0m\x1b[7m{hud[:cols].ljust(cols)}\x1b[0m")
                 sys.stdout.write("".join(out))
                 sys.stdout.flush()
